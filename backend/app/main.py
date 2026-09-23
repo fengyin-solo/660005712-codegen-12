@@ -1,6 +1,7 @@
-import random, math
+import random, math, time, threading
 import numpy as np
-from fastapi import FastAPI
+from datetime import datetime, timedelta
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -176,3 +177,174 @@ def analyze_roi(req: ROIAnalyzeRequest):
 @app.get("/api/windows")
 def get_windows():
     return {"presets": WINDOW_PRESETS}
+
+
+# ============================================================
+# 影像来源设备 (imaging source devices)
+# ============================================================
+
+DEVICE_TICK_SECONDS = 5
+OFFLINE_MIN_TICKS = 6   # 离线至少 30s 后自动恢复
+OFFLINE_MAX_TICKS = 12
+_RECENT_LIMIT = 6
+
+_PATIENTS = ["张伟", "王芳", "李娜", "刘洋", "陈静", "杨磊", "赵敏", "黄强", "周丽", "吴勇"]
+_MODALITY_TEMPLATES = {
+    "CT": [("胸部平扫", "chest"), ("腹部平扫", "abdomen"), ("头颅平扫", "brain")],
+    "MR": [("头颅MRI", "brain"), ("腹部MRI", "abdomen")],
+    "DR": [("胸部正位片", None), ("腹部立位片", None)],
+}
+
+_devices_lock = threading.Lock()
+_devices: dict = {}
+_sim_rng = random.Random(20240601)
+
+
+def _iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts).isoformat(timespec="seconds")
+
+
+def _make_study(device_id: str, modality: str) -> dict:
+    seq = _devices[device_id]["counter"] + 1
+    _devices[device_id]["counter"] = seq
+    description, preset = _sim_rng.choice(_MODALITY_TEMPLATES[modality])
+    return {
+        "studyId": f"{device_id}-S{seq:04d}",
+        "patientName": _sim_rng.choice(_PATIENTS),
+        "patientId": f"P{_sim_rng.randint(100000, 999999)}",
+        "modality": modality,
+        "bodyPart": description,
+        "preset": preset,
+        "receivedAt": _iso(time.time()),
+    }
+
+
+def _seed_device(device_id: str, name: str, modality: str, room: str,
+                 status: str, seed_studies: int, newest_age_minutes: int):
+    now = time.time()
+    _devices[device_id] = {
+        "deviceId": device_id,
+        "name": name,
+        "modality": modality,
+        "room": room,
+        "status": status,
+        "lastConnectedAt": now if status != "offline" else now - 900,
+        "totalStudies": 0,
+        "counter": 0,
+        "recent": [],
+        "offlineTicks": 0,
+    }
+    # 从旧到新补造历史检查
+    for i in range(seed_studies, 0, -1):
+        study = _make_study(device_id, modality)
+        study["receivedAt"] = _iso(now - newest_age_minutes * 60 - i * 480)
+        _devices[device_id]["recent"].append(study)
+    _devices[device_id]["recent"].reverse()
+    _devices[device_id]["totalStudies"] = max(len(_devices[device_id]["recent"]),
+                                              _devices[device_id]["counter"])
+
+
+def _device_simulation_loop():
+    """后台线程：周期性驱动设备心跳、上下线与新检查推送。"""
+    while True:
+        time.sleep(DEVICE_TICK_SECONDS)
+        with _devices_lock:
+            for dev in _devices.values():
+                now = time.time()
+                if dev["status"] == "offline":
+                    dev["offlineTicks"] += 1
+                    if dev["offlineTicks"] >= _sim_rng.randint(OFFLINE_MIN_TICKS, OFFLINE_MAX_TICKS):
+                        # 恢复连接
+                        dev["status"] = "idle"
+                        dev["offlineTicks"] = 0
+                        dev["lastConnectedAt"] = now
+                    continue
+
+                # 在线设备：心跳持续上报最近连接时间
+                dev["lastConnectedAt"] = now
+
+                if _sim_rng.random() < 0.12:
+                    dev["status"] = "offline"
+                    dev["offlineTicks"] = 0
+                elif dev["status"] == "examining":
+                    if _sim_rng.random() < 0.6:
+                        study = _make_study(dev["deviceId"], dev["modality"])
+                        dev["recent"].insert(0, study)
+                        del dev["recent"][_RECENT_LIMIT:]
+                        dev["totalStudies"] += 1
+                        dev["status"] = "idle"
+                else:
+                    if _sim_rng.random() < 0.3:
+                        dev["status"] = "examining"
+
+
+def _serialize_study(study: dict) -> dict:
+    return {
+        "studyId": study["studyId"],
+        "patientName": study["patientName"],
+        "patientId": study["patientId"],
+        "modality": study["modality"],
+        "bodyPart": study["bodyPart"],
+        "preset": study.get("preset"),
+        "receivedAt": study["receivedAt"],
+    }
+
+
+def _serialize_device(dev: dict) -> dict:
+    return {
+        "deviceId": dev["deviceId"],
+        "name": dev["name"],
+        "modality": dev["modality"],
+        "room": dev["room"],
+        "status": dev["status"],
+        "lastConnectedAt": _iso(dev["lastConnectedAt"]),
+        "totalStudies": dev["totalStudies"],
+        "recentStudies": [_serialize_study(s) for s in dev["recent"][:5]],
+    }
+
+
+_seed_device("CT-01", "1号CT机", "CT", "CT室1", "idle", 3, 40)
+_seed_device("DR-02", "2号DR机", "DR", "放射室2", "examining", 2, 15)
+_seed_device("MR-03", "3号MRI机", "MR", "磁共振室3", "offline", 4, 180)
+
+threading.Thread(target=_device_simulation_loop, daemon=True).start()
+
+
+@app.get("/api/devices")
+def list_devices():
+    with _devices_lock:
+        devices = [_serialize_device(d) for d in _devices.values()]
+    devices.sort(key=lambda d: (d["status"] == "offline", d["deviceId"]))
+    return {"devices": devices, "serverTime": _iso(time.time())}
+
+
+@app.get("/api/devices/{device_id}")
+def get_device(device_id: str):
+    with _devices_lock:
+        dev = _devices.get(device_id)
+        if dev is None:
+            raise HTTPException(status_code=404, detail="设备不存在")
+        return _serialize_device(dev)
+
+
+@app.post("/api/devices/{device_id}/pull")
+def pull_device_studies(device_id: str):
+    """从设备重新拉取检查；离线设备不允许拉取(恢复后可再调用)。"""
+    with _devices_lock:
+        dev = _devices.get(device_id)
+        if dev is None:
+            raise HTTPException(status_code=404, detail="设备不存在")
+        if dev["status"] == "offline":
+            raise HTTPException(status_code=409, detail="设备离线，暂不可拉取；恢复连接后请重试")
+        pulled = []
+        if _sim_rng.random() < 0.7:
+            study = _make_study(device_id, dev["modality"])
+            dev["recent"].insert(0, study)
+            del dev["recent"][_RECENT_LIMIT:]
+            dev["totalStudies"] += 1
+            pulled.append(study)
+        return {
+            "device": _serialize_device(dev),
+            "pulledCount": len(pulled),
+            "pulledStudies": [_serialize_study(s) for s in pulled],
+        }
