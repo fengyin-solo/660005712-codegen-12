@@ -3,6 +3,9 @@
     <header class="top-bar">
       <h1>🩻 三维医学影像体渲染与ROI标注平台</h1>
       <div class="tools">
+        <el-badge :hidden="!deviceStore.allOffline" is-dot type="danger">
+          <el-button size="small" @click="deviceStore.openDrawer()">📡 影像来源设备</el-button>
+        </el-badge>
         <el-select v-model="store.preset" size="small" style="width:120px">
           <el-option value="brain" label="头部CT"/><el-option value="chest" label="胸部CT"/><el-option value="abdomen" label="腹部CT"/>
         </el-select>
@@ -25,16 +28,23 @@
     <div class="loading-state" v-else-if="!store.loading">
       <div class="placeholder">选择预设并点击"载入影像"开始分析</div>
     </div>
+    <DeviceDrawer />
   </div>
 </template>
 
 <script setup lang="ts">
+import { onMounted } from 'vue'
 import VolumeRenderer from './components/VolumeRenderer.vue'
 import MPRView from './components/MPRView.vue'
 import WindowControl from './components/WindowControl.vue'
 import ROIPanel from './components/ROIPanel.vue'
+import DeviceDrawer from './components/DeviceDrawer.vue'
 import { useImagingStore } from './store/imaging'
+import { useDeviceStore } from './store/devices'
 const store = useImagingStore()
+const deviceStore = useDeviceStore()
+
+onMounted(() => { deviceStore.init() })
 </script>
 
 <style>

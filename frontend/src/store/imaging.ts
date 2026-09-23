@@ -12,7 +12,8 @@ export const useImagingStore = defineStore('imaging', () => {
   const roiResults = ref<ROIResult[]>([])
   const mprSlice = ref({ axial: 32, coronal: 32, sagittal: 32 })
 
-  async function loadVolume() {
+  async function loadVolume(usePreset?: string) {
+    if (usePreset) preset.value = usePreset
     loading.value = true
     try {
       const { data } = await axios.post('/api/volume', {

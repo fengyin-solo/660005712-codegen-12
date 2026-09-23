@@ -1,11 +1,25 @@
 import random, math
+from contextlib import asynccontextmanager
 import numpy as np
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="Medical Imaging Viewer")
+from .devices import registry, router as devices_router, ws_router as devices_ws_router
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 启动设备状态模拟器与 WebSocket 推送
+    await registry.start()
+    yield
+    await registry.stop()
+
+
+app = FastAPI(title="Medical Imaging Viewer", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.include_router(devices_router)
+app.include_router(devices_ws_router)
 
 
 class VolumeRequest(BaseModel):
